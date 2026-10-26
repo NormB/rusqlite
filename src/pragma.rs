@@ -38,7 +38,7 @@ impl Sql {
                 conn.prepare(SQL)
             }
         }?;
-        if stmt.exists([pragma_name])? {
+        if stmt.exists([pragma_name])? || is_sqlcipher_pragma(pragma_name) {
             self.buf.push_str(pragma_name);
             Ok(())
         } else {
@@ -284,6 +284,66 @@ impl Connection {
     }
 }
 
+/// Pragmas that SQLCipher implements in `sqlcipher_codec_pragma`, which runs
+/// before SQLite's pragma table lookup, so `pragma_list` does not list them.
+/// Taken from SQLCipher 4.19.0; the test-only `cipher_test*` pragmas are left
+/// out. `key`, `rekey`, `hexkey`, `hexrekey`, `textkey` and `page_size` are
+/// in SQLite's pragma table, so `pragma_list` already has them.
+#[cfg(any(feature = "sqlcipher", feature = "bundled-sqlcipher"))]
+const SQLCIPHER_PRAGMAS: &[&str] = &[
+    "cipher",
+    "cipher_add_random",
+    "cipher_compatibility",
+    "cipher_default_compatibility",
+    "cipher_default_hmac_algorithm",
+    "cipher_default_kdf_algorithm",
+    "cipher_default_kdf_iter",
+    "cipher_default_page_size",
+    "cipher_default_plaintext_header_size",
+    "cipher_default_settings",
+    "cipher_default_use_hmac",
+    "cipher_fips_status",
+    "cipher_hmac_algorithm",
+    "cipher_hmac_pgno",
+    "cipher_hmac_salt_mask",
+    "cipher_integrity_check",
+    "cipher_kdf_algorithm",
+    "cipher_log",
+    "cipher_log_level",
+    "cipher_log_source",
+    "cipher_memory_security",
+    "cipher_migrate",
+    "cipher_page_size",
+    "cipher_plaintext_header_size",
+    "cipher_profile",
+    "cipher_provider",
+    "cipher_provider_version",
+    "cipher_salt",
+    "cipher_settings",
+    "cipher_status",
+    "cipher_store_pass",
+    "cipher_use_hmac",
+    "cipher_version",
+    "fast_kdf_iter",
+    "kdf_iter",
+    "rekey_cipher",
+    "rekey_kdf_iter",
+];
+
+fn is_sqlcipher_pragma(pragma_name: &str) -> bool {
+    cfg_select! {
+        any(feature = "sqlcipher", feature = "bundled-sqlcipher") => {
+            // no_fmt
+            SQLCIPHER_PRAGMAS.contains(&pragma_name)
+        }
+        _ => {
+            // no_fmt
+            let _ = pragma_name;
+            false
+        }
+    }
+}
+
 fn is_identifier(s: &str) -> bool {
     let chars = s.char_indices();
     for (i, ch) in chars {
@@ -472,6 +532,65 @@ mod test {
             error_from_sqlite_code(
                 ffi::SQLITE_MISUSE,
                 Some("Invalid pragma \"boom\"".to_owned())
+            )
+        );
+        Ok(())
+    }
+
+    // SQLCipher handles its own pragmas before SQLite's pragma table lookup,
+    // so `pragma_list` does not list them.
+    #[test]
+    #[cfg(any(feature = "sqlcipher", feature = "bundled-sqlcipher"))]
+    #[cfg_attr(miri, ignore)]
+    fn sqlcipher_pragma() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.pragma_update(None, "key", "secret")?;
+        db.pragma_update(None, "cipher_page_size", 8192)?;
+        // SQLCipher returns its settings as text.
+        let page_size: String =
+            db.pragma_query_value(None, "cipher_page_size", |row| row.get(0))?;
+        assert_eq!("8192", page_size);
+        db.pragma_update(None, "kdf_iter", 1000)?;
+        let kdf_iter: String = db.pragma_query_value(None, "kdf_iter", |row| row.get(0))?;
+        assert_eq!("1000", kdf_iter);
+
+        let err = db.pragma_update(None, "cipher_bogus", "1").unwrap_err();
+        assert_eq!(
+            err,
+            error_from_sqlite_code(
+                ffi::SQLITE_MISUSE,
+                Some("Invalid pragma \"cipher_bogus\"".to_owned())
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(feature = "bundled-sqlcipher")]
+    #[cfg_attr(miri, ignore)]
+    fn sqlcipher_log_level() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.pragma_update(None, "cipher_log_level", "WARN")?;
+        let level: String = db.pragma_query_value(None, "cipher_log_level", |row| row.get(0))?;
+        assert_eq!("WARN", level);
+        let version: String = db.pragma_query_value(None, "cipher_version", |row| row.get(0))?;
+        assert!(!version.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(any(feature = "sqlcipher", feature = "bundled-sqlcipher")))]
+    #[cfg_attr(miri, ignore)]
+    fn sqlcipher_pragma_without_sqlcipher() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        let err = db
+            .pragma_update(None, "cipher_log_level", "WARN")
+            .unwrap_err();
+        assert_eq!(
+            err,
+            error_from_sqlite_code(
+                ffi::SQLITE_MISUSE,
+                Some("Invalid pragma \"cipher_log_level\"".to_owned())
             )
         );
         Ok(())
